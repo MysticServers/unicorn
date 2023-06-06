@@ -26,8 +26,6 @@
 //! ```
 //!
 
-#![no_std]
-
 #[macro_use]
 extern crate alloc;
 extern crate std;
@@ -52,11 +50,13 @@ pub use crate::{
     unicorn_const::*, x86::*,
 };
 
-use alloc::{boxed::Box, rc::Rc, vec::Vec};
+pub mod afl;
+pub mod utils;
+
 use core::{cell::UnsafeCell, ptr};
 use ffi::uc_handle;
 use libc::c_void;
-use unicorn_const::{uc_error, Arch, HookType, MemRegion, MemType, Mode, Permission, Query};
+use std::rc::Rc;
 
 #[derive(Debug)]
 pub struct Context {
@@ -132,8 +132,7 @@ impl<'a> MmioCallbackScope<'a> {
 }
 
 pub struct UnicornInner<'a, D> {
-    pub handle: uc_handle,
-    pub ffi: bool,
+    pub uc: uc_handle,
     pub arch: Arch,
     /// to keep ownership over the hook for this uc instance's lifetime
     pub hooks: Vec<(ffi::uc_hook, Box<dyn ffi::IsUcHook<'a> + 'a>)>,
@@ -145,10 +144,10 @@ pub struct UnicornInner<'a, D> {
 /// Drop UC
 impl<'a, D> Drop for UnicornInner<'a, D> {
     fn drop(&mut self) {
-        if !self.ffi && !self.handle.is_null() {
-            unsafe { ffi::uc_close(self.handle) };
+        if !self.uc.is_null() {
+            unsafe { ffi::uc_close(self.uc) };
         }
-        self.handle = ptr::null_mut();
+        self.uc = ptr::null_mut();
     }
 }
 
@@ -179,8 +178,7 @@ impl<'a> TryFrom<uc_handle> for Unicorn<'a, ()> {
         }
         Ok(Unicorn {
             inner: Rc::new(UnsafeCell::from(UnicornInner {
-                handle,
-                ffi: true,
+                uc: handle,
                 arch: arch.try_into()?,
                 data: (),
                 hooks: vec![],
@@ -202,8 +200,7 @@ where
         if err == uc_error::OK {
             Ok(Unicorn {
                 inner: Rc::new(UnsafeCell::from(UnicornInner {
-                    handle,
-                    ffi: false,
+                    uc: handle,
                     arch,
                     data,
                     hooks: vec![],
@@ -255,7 +252,7 @@ impl<'a, D> Unicorn<'a, D> {
     /// Return the handle of the current emulator.
     #[must_use]
     pub fn get_handle(&self) -> uc_handle {
-        self.inner().handle
+        self.inner().uc
     }
 
     /// Returns a vector with the memory regions that are mapped in the emulator.
@@ -885,7 +882,12 @@ impl<'a, D> Unicorn<'a, D> {
         }
     }
 
-    pub fn add_tlb_hook<F>(&mut self, begin: u64, end: u64, callback: F) -> Result<ffi::uc_hook, uc_error>
+    pub fn add_tlb_hook<F>(
+        &mut self,
+        begin: u64,
+        end: u64,
+        callback: F,
+    ) -> Result<ffi::uc_hook, uc_error>
     where
         F: FnMut(&mut crate::Unicorn<D>, u64, MemType) -> Option<TlbEntry> + 'a,
     {
@@ -895,7 +897,8 @@ impl<'a, D> Unicorn<'a, D> {
             uc: Rc::downgrade(&self.inner),
         });
         let err = unsafe {
-            ffi::uc_hook_add(self.get_handle(),
+            ffi::uc_hook_add(
+                self.get_handle(),
                 &mut hook_ptr,
                 HookType::TLB,
                 ffi::tlb_lookup_hook_proxy::<D, F> as _,
@@ -922,7 +925,7 @@ impl<'a, D> Unicorn<'a, D> {
             .hooks
             .retain(|(hook_ptr, _hook_impl)| hook_ptr != &hook);
 
-        let err: uc_error = unsafe { ffi::uc_hook_del(inner.handle, hook) };
+        let err: uc_error = unsafe { ffi::uc_hook_del(inner.uc, hook) };
 
         if err == uc_error::OK {
             Ok(())
@@ -1083,7 +1086,13 @@ impl<'a, D> Unicorn<'a, D> {
 
     pub fn ctl_get_mode(&self) -> Result<Mode, uc_error> {
         let mut result: i32 = Default::default();
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_READ!(ControlType::UC_CTL_UC_MODE), &mut result) };
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_READ!(ControlType::UC_CTL_UC_MODE),
+                &mut result,
+            )
+        };
         if err == uc_error::OK {
             Ok(Mode::from_bits_truncate(result))
         } else {
@@ -1093,7 +1102,13 @@ impl<'a, D> Unicorn<'a, D> {
 
     pub fn ctl_get_page_size(&self) -> Result<u32, uc_error> {
         let mut result: u32 = Default::default();
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_READ!(ControlType::UC_CTL_UC_PAGE_SIZE), &mut result) };
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_READ!(ControlType::UC_CTL_UC_PAGE_SIZE),
+                &mut result,
+            )
+        };
         if err == uc_error::OK {
             Ok(result)
         } else {
@@ -1102,7 +1117,13 @@ impl<'a, D> Unicorn<'a, D> {
     }
 
     pub fn ctl_set_page_size(&self, page_size: u32) -> Result<(), uc_error> {
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_WRITE!(ControlType::UC_CTL_UC_PAGE_SIZE), page_size) };
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_WRITE!(ControlType::UC_CTL_UC_PAGE_SIZE),
+                page_size,
+            )
+        };
         if err == uc_error::OK {
             Ok(())
         } else {
@@ -1112,7 +1133,13 @@ impl<'a, D> Unicorn<'a, D> {
 
     pub fn ctl_get_arch(&self) -> Result<Arch, uc_error> {
         let mut result: i32 = Default::default();
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_READ!(ControlType::UC_CTL_UC_ARCH), &mut result) };
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_READ!(ControlType::UC_CTL_UC_ARCH),
+                &mut result,
+            )
+        };
         if err == uc_error::OK {
             Arch::try_from(result as usize)
         } else {
@@ -1122,7 +1149,13 @@ impl<'a, D> Unicorn<'a, D> {
 
     pub fn ctl_get_timeout(&self) -> Result<u64, uc_error> {
         let mut result: u64 = Default::default();
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_READ!(ControlType::UC_CTL_UC_TIMEOUT), &mut result) };
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_READ!(ControlType::UC_CTL_UC_TIMEOUT),
+                &mut result,
+            )
+        };
         if err == uc_error::OK {
             Ok(result)
         } else {
@@ -1131,7 +1164,13 @@ impl<'a, D> Unicorn<'a, D> {
     }
 
     pub fn ctl_exits_enable(&self) -> Result<(), uc_error> {
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_WRITE!(ControlType::UC_CTL_UC_USE_EXITS), 1) };
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_WRITE!(ControlType::UC_CTL_UC_USE_EXITS),
+                1,
+            )
+        };
         if err == uc_error::OK {
             Ok(())
         } else {
@@ -1140,7 +1179,13 @@ impl<'a, D> Unicorn<'a, D> {
     }
 
     pub fn ctl_exits_disable(&self) -> Result<(), uc_error> {
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_WRITE!(ControlType::UC_CTL_UC_USE_EXITS), 0) };
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_WRITE!(ControlType::UC_CTL_UC_USE_EXITS),
+                0,
+            )
+        };
         if err == uc_error::OK {
             Ok(())
         } else {
@@ -1150,7 +1195,13 @@ impl<'a, D> Unicorn<'a, D> {
 
     pub fn ctl_get_exits_count(&self) -> Result<usize, uc_error> {
         let mut result: libc::size_t = Default::default();
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_READ!(ControlType::UC_CTL_UC_EXITS_CNT), &mut result) };
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_READ!(ControlType::UC_CTL_UC_EXITS_CNT),
+                &mut result,
+            )
+        };
         if err == uc_error::OK {
             Ok(result)
         } else {
@@ -1161,17 +1212,33 @@ impl<'a, D> Unicorn<'a, D> {
     pub fn ctl_get_exits(&self) -> Result<Vec<u64>, uc_error> {
         let exits_count: libc::size_t = self.ctl_get_exits_count()?;
         let mut exits: Vec<u64> = Vec::with_capacity(exits_count);
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_READ!(ControlType::UC_CTL_UC_EXITS), exits.as_mut_ptr(), exits_count) };
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_READ!(ControlType::UC_CTL_UC_EXITS),
+                exits.as_mut_ptr(),
+                exits_count,
+            )
+        };
         if err == uc_error::OK {
-            unsafe { exits.set_len(exits_count); }
+            unsafe {
+                exits.set_len(exits_count);
+            }
             Ok(exits)
         } else {
             Err(err)
         }
     }
 
-   pub fn ctl_set_exits(&self, exits: &[u64]) -> Result<(), uc_error> {
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_WRITE!(ControlType::UC_CTL_UC_EXITS), exits.as_ptr(), exits.len() as libc::size_t) };
+    pub fn ctl_set_exits(&self, exits: &[u64]) -> Result<(), uc_error> {
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_WRITE!(ControlType::UC_CTL_UC_EXITS),
+                exits.as_ptr(),
+                exits.len() as libc::size_t,
+            )
+        };
         if err == uc_error::OK {
             Ok(())
         } else {
@@ -1181,7 +1248,13 @@ impl<'a, D> Unicorn<'a, D> {
 
     pub fn ctl_get_cpu_model(&self) -> Result<i32, uc_error> {
         let mut result: i32 = Default::default();
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_READ!(ControlType::UC_CTL_CPU_MODEL), &mut result) };
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_READ!(ControlType::UC_CTL_CPU_MODEL),
+                &mut result,
+            )
+        };
         if err == uc_error::OK {
             Ok(result)
         } else {
@@ -1190,7 +1263,13 @@ impl<'a, D> Unicorn<'a, D> {
     }
 
     pub fn ctl_set_cpu_model(&self, cpu_model: i32) -> Result<(), uc_error> {
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_WRITE!(ControlType::UC_CTL_CPU_MODEL), cpu_model) };
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_WRITE!(ControlType::UC_CTL_CPU_MODEL),
+                cpu_model,
+            )
+        };
         if err == uc_error::OK {
             Ok(())
         } else {
@@ -1199,7 +1278,14 @@ impl<'a, D> Unicorn<'a, D> {
     }
 
     pub fn ctl_remove_cache(&self, address: u64, end: u64) -> Result<(), uc_error> {
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_WRITE!(ControlType::UC_CTL_TB_REMOVE_CACHE), address, end) };
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_WRITE!(ControlType::UC_CTL_TB_REMOVE_CACHE),
+                address,
+                end,
+            )
+        };
         if err == uc_error::OK {
             Ok(())
         } else {
@@ -1207,8 +1293,19 @@ impl<'a, D> Unicorn<'a, D> {
         }
     }
 
-    pub fn ctl_request_cache(&self, address: u64, tb: &mut TranslationBlock) -> Result<(), uc_error> {
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_READ_WRITE!(ControlType::UC_CTL_TB_REQUEST_CACHE), address, tb) };
+    pub fn ctl_request_cache(
+        &self,
+        address: u64,
+        tb: &mut TranslationBlock,
+    ) -> Result<(), uc_error> {
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_READ_WRITE!(ControlType::UC_CTL_TB_REQUEST_CACHE),
+                address,
+                tb,
+            )
+        };
         if err == uc_error::OK {
             Ok(())
         } else {
@@ -1217,7 +1314,12 @@ impl<'a, D> Unicorn<'a, D> {
     }
 
     pub fn ctl_flush_tb(&self) -> Result<(), uc_error> {
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_WRITE!(ControlType::UC_CTL_TB_FLUSH)) };
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_WRITE!(ControlType::UC_CTL_TB_FLUSH),
+            )
+        };
         if err == uc_error::OK {
             Ok(())
         } else {
@@ -1226,7 +1328,12 @@ impl<'a, D> Unicorn<'a, D> {
     }
 
     pub fn ctl_flush_tlb(&self) -> Result<(), uc_error> {
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_WRITE!(ControlType::UC_CTL_TLB_FLUSH)) };
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_WRITE!(ControlType::UC_CTL_TLB_FLUSH),
+            )
+        };
         if err == uc_error::OK {
             Ok(())
         } else {
@@ -1235,7 +1342,13 @@ impl<'a, D> Unicorn<'a, D> {
     }
 
     pub fn ctl_tlb_type(&self, t: TlbType) -> Result<(), uc_error> {
-        let err = unsafe { ffi::uc_ctl(self.get_handle(), UC_CTL_WRITE!(ControlType::UC_CTL_TLB_TYPE), t as i32) };
+        let err = unsafe {
+            ffi::uc_ctl(
+                self.get_handle(),
+                UC_CTL_WRITE!(ControlType::UC_CTL_TLB_TYPE),
+                t as i32,
+            )
+        };
         if err == uc_error::OK {
             Ok(())
         } else {

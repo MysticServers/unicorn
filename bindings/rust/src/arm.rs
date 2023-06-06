@@ -2,7 +2,7 @@
 // For Unicorn Engine. AUTO-GENERATED FILE, DO NOT EDIT
 
 #[repr(C)]
-#[derive(PartialEq, Debug, Clone, Copy)]
+#[derive(PartialEq, Eq, Debug, Clone, Copy, Hash)]
 pub enum RegisterARM {
     // ARM registers
     INVALID = 0,

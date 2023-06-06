@@ -4,9 +4,9 @@
 use crate::{Unicorn, UnicornInner};
 
 use super::unicorn_const::{uc_error, Arch, HookType, MemRegion, MemType, Mode, Query, TlbEntry};
-use alloc::rc::Weak;
 use core::{cell::UnsafeCell, ffi::c_void};
 use libc::{c_char, c_int};
+use std::rc::Weak;
 
 pub type uc_handle = *mut c_void;
 pub type uc_hook = *mut c_void;
@@ -253,7 +253,13 @@ where
     (user_data.callback)(&mut user_data_uc);
 }
 
-pub extern "C" fn tlb_lookup_hook_proxy<D, F>(uc: uc_handle, vaddr: u64, mem_type: MemType, result: *mut TlbEntry, user_data: *mut UcHook<D, F>) -> bool
+pub extern "C" fn tlb_lookup_hook_proxy<D, F>(
+    uc: uc_handle,
+    vaddr: u64,
+    mem_type: MemType,
+    result: *mut TlbEntry,
+    user_data: *mut UcHook<D, F>,
+) -> bool
 where
     F: FnMut(&mut crate::Unicorn<D>, u64, MemType) -> Option<TlbEntry>,
 {
@@ -264,13 +270,11 @@ where
     debug_assert_eq!(uc, user_data_uc.get_handle());
     let r = (user_data.callback)(&mut user_data_uc, vaddr, mem_type);
     match r {
-        Some(ref e) => {
-            unsafe {
-                let ref_result: &mut TlbEntry = &mut *result;
-                *ref_result = *e;
-            }
+        Some(ref e) => unsafe {
+            let ref_result: &mut TlbEntry = &mut *result;
+            *ref_result = *e;
         },
-        None => {},
+        None => {}
     };
     return r.is_some();
 }
